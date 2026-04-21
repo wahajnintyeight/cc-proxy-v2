@@ -41,11 +41,11 @@ A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Anthr
 
    *   `ANTHROPIC_API_KEY`: (Optional) Needed only if proxying *to* Anthropic models.
    *   `OPENAI_API_KEY`: Your OpenAI API key (Required if using the default OpenAI preference or as fallback).
-   *   `GEMINI_API_KEY`: Your Google AI Studio (Gemini) API key (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=true`).
+   *   `GEMINI_API_KEY`: Your Google AI Studio (Gemini) API key (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=false`).
    *   `USE_VERTEX_AUTH` (Optional): Set to `true` to use Application Default Credentials (ADC) will be used (no static API key required). Note: when USE_VERTEX_AUTH=true, you must configure `VERTEX_PROJECT` and `VERTEX_LOCATION`.
    *   `VERTEX_PROJECT` (Optional): Your Google Cloud Project ID (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=true`).
    *   `VERTEX_LOCATION` (Optional): The Google Cloud region for Vertex AI (e.g., `us-central1`) (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=true`).
-   *   `PREFERRED_PROVIDER` (Optional): Set to `openai` (default), `google`, or `anthropic`. This determines the primary backend for mapping `haiku`/`sonnet`.
+   *   `PREFERRED_PROVIDER` (Optional): Set to `openai` (default), `google`, `anthropic`, or `openrouter`. This determines the primary backend for mapping `haiku`/`sonnet`.
    *   `BIG_MODEL` (Optional): The model to map `sonnet` requests to. Defaults to `gpt-4.1` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.5-pro-preview-03-25`. Ignored when `PREFERRED_PROVIDER=anthropic`.
    *   `SMALL_MODEL` (Optional): The model to map `haiku` requests to. Defaults to `gpt-4.1-mini` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.0-flash`. Ignored when `PREFERRED_PROVIDER=anthropic`.
 
@@ -54,7 +54,31 @@ A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Anthr
    - If `PREFERRED_PROVIDER=google`, `haiku`/`sonnet` map to `SMALL_MODEL`/`BIG_MODEL` prefixed with `gemini/` *if* those models are in the server's known `GEMINI_MODELS` list (otherwise falls back to OpenAI mapping).
    - If `PREFERRED_PROVIDER=anthropic`, `haiku`/`sonnet` requests are passed directly to Anthropic with the `anthropic/` prefix without remapping to different models.
 
-4. **Run the server**:
+4. **Run the server (recommended: CLI quick startup)**:
+   ```bash
+   uv run python cli.py --p google
+   ```
+
+   Useful CLI arguments:
+   - `--p` / `--provider`: `openai`, `google`, `anthropic`, `openrouter`
+   - `--big-model`: Sets `BIG_MODEL`
+   - `--small-model`: Sets `SMALL_MODEL`
+   - `--host`: Server bind host
+   - `--port`: Server bind port
+
+   CLI behavior:
+   - If selected provider already has valid credentials in `.env`, CLI reuses them and only asks for model overrides (unless you pass `--big-model` / `--small-model`).
+   - If credentials are missing, CLI prompts for the missing provider setup and writes updates to `.env`.
+
+   More examples:
+   ```bash
+   uv run python cli.py --p anthropic
+   uv run python cli.py --p openrouter --host 0.0.0.0 --port 8082
+   uv run python cli.py --p openai --big-model gpt-4.1 --small-model gpt-4.1-mini
+   uv run python cli.py --provider google --big-model gemini-2.5-pro --small-model gemini-2.5-flash
+   ```
+
+   Alternative direct run:
    ```bash
    uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
    ```

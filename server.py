@@ -1,126 +1,39 @@
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
-import logging
 import json
-from pydantic import BaseModel, Field, field_validator
-from typing import List, Dict, Any, Optional, Union, Literal
-import httpx
-import os
-from fastapi.responses import JSONResponse, StreamingResponse
+from typing import Any, Dict, Union
+from fastapi.responses import StreamingResponse
 import litellm
 import uuid
 import time
-from dotenv import load_dotenv
-import re
-from datetime import datetime
 import sys
 
-# Load environment variables from .env file
-load_dotenv()
-
-# Configure logging
-logging.basicConfig(
-    level=logging.WARN,  # Change to INFO level to show more details
-    format='%(asctime)s - %(levelname)s - %(message)s',
+from config import (
+    ANTHROPIC_API_KEY,
+    GEMINI_API_KEY,
+    OPENAI_API_KEY,
+    OPENAI_BASE_URL,
+    OPENROUTER_API_KEY,
+    OPENROUTER_APP_NAME,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_SITE_URL,
+    USE_VERTEX_AUTH,
+    VERTEX_LOCATION,
+    VERTEX_PROJECT,
+    strip_provider_prefix,
 )
-logger = logging.getLogger(__name__)
+from logging_utils import configure_logging, log_request_beautifully
+from schemas import (
+    MessagesRequest,
+    MessagesResponse,
+    TokenCountRequest,
+    TokenCountResponse,
+    Usage,
+)
 
-# Configure uvicorn to be quieter
-import uvicorn
-# Tell uvicorn's loggers to be quiet
-logging.getLogger("uvicorn").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
-
-# Create a filter to block any log messages containing specific strings
-class MessageFilter(logging.Filter):
-    def filter(self, record):
-        # Block messages containing these strings
-        blocked_phrases = [
-            "LiteLLM completion()",
-            "HTTP Request:", 
-            "selected model name for cost calculation",
-            "utils.py",
-            "cost_calculator"
-        ]
-        
-        if hasattr(record, 'msg') and isinstance(record.msg, str):
-            for phrase in blocked_phrases:
-                if phrase in record.msg:
-                    return False
-        return True
-
-# Apply the filter to the root logger to catch all messages
-root_logger = logging.getLogger()
-root_logger.addFilter(MessageFilter())
-
-# Custom formatter for model mapping logs
-class ColorizedFormatter(logging.Formatter):
-    """Custom formatter to highlight model mappings"""
-    BLUE = "\033[94m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    
-    def format(self, record):
-        if record.levelno == logging.debug and "MODEL MAPPING" in record.msg:
-            # Apply colors and formatting to model mapping logs
-            return f"{self.BOLD}{self.GREEN}{record.msg}{self.RESET}"
-        return super().format(record)
-
-# Apply custom formatter to console handler
-for handler in logger.handlers:
-    if isinstance(handler, logging.StreamHandler):
-        handler.setFormatter(ColorizedFormatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger = configure_logging(__name__)
 
 app = FastAPI()
-
-# Get API keys from environment
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-# Get Vertex AI project and location from environment (if set)
-VERTEX_PROJECT = os.environ.get("VERTEX_PROJECT", "unset")
-VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "unset")
-
-# Option to use Gemini API key instead of ADC for Vertex AI
-USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
-
-# Get OpenAI base URL from environment (if set)
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
-
-# Get preferred provider (default to openai)
-PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
-
-# Get model mapping configuration from environment
-# Default to latest OpenAI models if not set
-BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
-SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
-
-# List of OpenAI models
-OPENAI_MODELS = [
-    "o3-mini",
-    "o1",
-    "o1-mini",
-    "o1-pro",
-    "gpt-4.5-preview",
-    "gpt-4o",
-    "gpt-4o-audio-preview",
-    "chatgpt-4o-latest",
-    "gpt-4o-mini",
-    "gpt-4o-mini-audio-preview",
-    "gpt-4.1",  # Added default big model
-    "gpt-4.1-mini" # Added default small model
-]
-
-# List of Gemini models
-GEMINI_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-pro"
-]
 
 # Helper function to clean schema for Gemini
 def clean_gemini_schema(schema: Any) -> Any:
@@ -145,215 +58,6 @@ def clean_gemini_schema(schema: Any) -> Any:
         return [clean_gemini_schema(item) for item in schema]
     return schema
 
-# Models for Anthropic API requests
-class ContentBlockText(BaseModel):
-    type: Literal["text"]
-    text: str
-
-class ContentBlockImage(BaseModel):
-    type: Literal["image"]
-    source: Dict[str, Any]
-
-class ContentBlockToolUse(BaseModel):
-    type: Literal["tool_use"]
-    id: str
-    name: str
-    input: Dict[str, Any]
-
-class ContentBlockToolResult(BaseModel):
-    type: Literal["tool_result"]
-    tool_use_id: str
-    content: Union[str, List[Dict[str, Any]], Dict[str, Any], List[Any], Any]
-
-class SystemContent(BaseModel):
-    type: Literal["text"]
-    text: str
-
-class Message(BaseModel):
-    role: Literal["user", "assistant"] 
-    content: Union[str, List[Union[ContentBlockText, ContentBlockImage, ContentBlockToolUse, ContentBlockToolResult]]]
-
-class Tool(BaseModel):
-    name: str
-    description: Optional[str] = None
-    input_schema: Dict[str, Any]
-
-class ThinkingConfig(BaseModel):
-    enabled: bool = True
-
-class MessagesRequest(BaseModel):
-    model: str
-    max_tokens: int
-    messages: List[Message]
-    system: Optional[Union[str, List[SystemContent]]] = None
-    stop_sequences: Optional[List[str]] = None
-    stream: Optional[bool] = False
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
-    metadata: Optional[Dict[str, Any]] = None
-    tools: Optional[List[Tool]] = None
-    tool_choice: Optional[Dict[str, Any]] = None
-    thinking: Optional[ThinkingConfig] = None
-    original_model: Optional[str] = None  # Will store the original model name
-    
-    @field_validator('model')
-    def validate_model_field(cls, v, info): # Renamed to avoid conflict
-        original_model = v
-        new_model = v # Default to original value
-
-        logger.debug(f"📋 MODEL VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'")
-
-        # Remove provider prefixes for easier matching
-        clean_v = v
-        if clean_v.startswith('anthropic/'):
-            clean_v = clean_v[10:]
-        elif clean_v.startswith('openai/'):
-            clean_v = clean_v[7:]
-        elif clean_v.startswith('gemini/'):
-            clean_v = clean_v[7:]
-
-        # --- Mapping Logic --- START ---
-        mapped = False
-        if PREFERRED_PROVIDER == "anthropic":
-            # Don't remap to big/small models, just add the prefix
-            new_model = f"anthropic/{clean_v}"
-            mapped = True
-
-        # Map Haiku to SMALL_MODEL based on provider preference
-        elif 'haiku' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{SMALL_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{SMALL_MODEL}"
-                mapped = True
-
-        # Map Sonnet to BIG_MODEL based on provider preference
-        elif 'sonnet' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{BIG_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{BIG_MODEL}"
-                mapped = True
-
-        # Add prefixes to non-mapped models if they match known lists
-        elif not mapped:
-            if clean_v in GEMINI_MODELS and not v.startswith('gemini/'):
-                new_model = f"gemini/{clean_v}"
-                mapped = True # Technically mapped to add prefix
-            elif clean_v in OPENAI_MODELS and not v.startswith('openai/'):
-                new_model = f"openai/{clean_v}"
-                mapped = True # Technically mapped to add prefix
-        # --- Mapping Logic --- END ---
-
-        if mapped:
-            logger.debug(f"📌 MODEL MAPPING: '{original_model}' ➡️ '{new_model}'")
-        else:
-             # If no mapping occurred and no prefix exists, log warning or decide default
-             if not v.startswith(('openai/', 'gemini/', 'anthropic/')):
-                 logger.warning(f"⚠️ No prefix or mapping rule for model: '{original_model}'. Using as is.")
-             new_model = v # Ensure we return the original if no rule applied
-
-        # Store the original model in the values dictionary
-        values = info.data
-        if isinstance(values, dict):
-            values['original_model'] = original_model
-
-        return new_model
-
-class TokenCountRequest(BaseModel):
-    model: str
-    messages: List[Message]
-    system: Optional[Union[str, List[SystemContent]]] = None
-    tools: Optional[List[Tool]] = None
-    thinking: Optional[ThinkingConfig] = None
-    tool_choice: Optional[Dict[str, Any]] = None
-    original_model: Optional[str] = None  # Will store the original model name
-    
-    @field_validator('model')
-    def validate_model_token_count(cls, v, info): # Renamed to avoid conflict
-        # Use the same logic as MessagesRequest validator
-        # NOTE: Pydantic validators might not share state easily if not class methods
-        # Re-implementing the logic here for clarity, could be refactored
-        original_model = v
-        new_model = v # Default to original value
-
-        logger.debug(f"📋 TOKEN COUNT VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'")
-
-        # Remove provider prefixes for easier matching
-        clean_v = v
-        if clean_v.startswith('anthropic/'):
-            clean_v = clean_v[10:]
-        elif clean_v.startswith('openai/'):
-            clean_v = clean_v[7:]
-        elif clean_v.startswith('gemini/'):
-            clean_v = clean_v[7:]
-
-        # --- Mapping Logic --- START ---
-        mapped = False
-        # Map Haiku to SMALL_MODEL based on provider preference
-        if 'haiku' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{SMALL_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{SMALL_MODEL}"
-                mapped = True
-
-        # Map Sonnet to BIG_MODEL based on provider preference
-        elif 'sonnet' in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{BIG_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{BIG_MODEL}"
-                mapped = True
-
-        # Add prefixes to non-mapped models if they match known lists
-        elif not mapped:
-            if clean_v in GEMINI_MODELS and not v.startswith('gemini/'):
-                new_model = f"gemini/{clean_v}"
-                mapped = True # Technically mapped to add prefix
-            elif clean_v in OPENAI_MODELS and not v.startswith('openai/'):
-                new_model = f"openai/{clean_v}"
-                mapped = True # Technically mapped to add prefix
-        # --- Mapping Logic --- END ---
-
-        if mapped:
-            logger.debug(f"📌 TOKEN COUNT MAPPING: '{original_model}' ➡️ '{new_model}'")
-        else:
-             if not v.startswith(('openai/', 'gemini/', 'anthropic/')):
-                 logger.warning(f"⚠️ No prefix or mapping rule for token count model: '{original_model}'. Using as is.")
-             new_model = v # Ensure we return the original if no rule applied
-
-        # Store the original model in the values dictionary
-        values = info.data
-        if isinstance(values, dict):
-            values['original_model'] = original_model
-
-        return new_model
-
-class TokenCountResponse(BaseModel):
-    input_tokens: int
-
-class Usage(BaseModel):
-    input_tokens: int
-    output_tokens: int
-    cache_creation_input_tokens: int = 0
-    cache_read_input_tokens: int = 0
-
-class MessagesResponse(BaseModel):
-    id: str
-    model: str
-    role: Literal["assistant"] = "assistant"
-    content: List[Union[ContentBlockText, ContentBlockToolUse]]
-    type: Literal["message"] = "message"
-    stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]] = None
-    stop_sequence: Optional[str] = None
-    usage: Usage
-
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     # Get request details
@@ -367,52 +71,6 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     
     return response
-
-# Not using validation function as we're using the environment API key
-
-def parse_tool_result_content(content):
-    """Helper function to properly parse and normalize tool result content."""
-    if content is None:
-        return "No content provided"
-        
-    if isinstance(content, str):
-        return content
-        
-    if isinstance(content, list):
-        result = ""
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                result += item.get("text", "") + "\n"
-            elif isinstance(item, str):
-                result += item + "\n"
-            elif isinstance(item, dict):
-                if "text" in item:
-                    result += item.get("text", "") + "\n"
-                else:
-                    try:
-                        result += json.dumps(item) + "\n"
-                    except:
-                        result += str(item) + "\n"
-            else:
-                try:
-                    result += str(item) + "\n"
-                except:
-                    result += "Unparseable content\n"
-        return result.strip()
-        
-    if isinstance(content, dict):
-        if content.get("type") == "text":
-            return content.get("text", "")
-        try:
-            return json.dumps(content)
-        except:
-            return str(content)
-            
-    # Fallback for any other type
-    try:
-        return str(content)
-    except:
-        return "Unparseable content"
 
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
     """Convert Anthropic API request format to LiteLLM format (which follows OpenAI)."""
@@ -548,9 +206,9 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     
     # Cap max_tokens for OpenAI models to their limit of 16384
     max_tokens = anthropic_request.max_tokens
-    if anthropic_request.model.startswith("openai/") or anthropic_request.model.startswith("gemini/"):
+    if anthropic_request.model.startswith(("openai/", "gemini/", "openrouter/")):
         max_tokens = min(max_tokens, 16384)
-        logger.debug(f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})")
+        logger.debug(f"Capping max_tokens to 16384 for OpenAI/Gemini/OpenRouter model (original value: {anthropic_request.max_tokens})")
     
     # Create LiteLLM request dict
     litellm_request = {
@@ -643,10 +301,7 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
     try:
         # Get the clean model name to check capabilities
         clean_model = original_request.model
-        if clean_model.startswith("anthropic/"):
-            clean_model = clean_model[len("anthropic/"):]
-        elif clean_model.startswith("openai/"):
-            clean_model = clean_model[len("openai/"):]
+        clean_model = strip_provider_prefix(clean_model)
         
         # Check if this is a Claude model (which supports content blocks)
         is_claude_model = clean_model.startswith("claude-")
@@ -1112,10 +767,7 @@ async def create_message(
         
         # Clean model name for capability check
         clean_model = request.model
-        if clean_model.startswith("anthropic/"):
-            clean_model = clean_model[len("anthropic/"):]
-        elif clean_model.startswith("openai/"):
-            clean_model = clean_model[len("openai/"):]
+        clean_model = strip_provider_prefix(clean_model)
         
         logger.debug(f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}")
         
@@ -1131,6 +783,20 @@ async def create_message(
                 logger.debug(f"Using OpenAI API key and custom base URL {OPENAI_BASE_URL} for model: {request.model}")
             else:
                 logger.debug(f"Using OpenAI API key for model: {request.model}")
+        elif request.model.startswith("openrouter/"):
+            litellm_request["api_key"] = OPENROUTER_API_KEY
+            if OPENROUTER_BASE_URL:
+                litellm_request["api_base"] = OPENROUTER_BASE_URL
+
+            openrouter_headers = {}
+            if OPENROUTER_SITE_URL:
+                openrouter_headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+            if OPENROUTER_APP_NAME:
+                openrouter_headers["X-Title"] = OPENROUTER_APP_NAME
+            if openrouter_headers:
+                litellm_request["extra_headers"] = openrouter_headers
+
+            logger.debug(f"Using OpenRouter API key and base URL {OPENROUTER_BASE_URL} for model: {request.model}")
         elif request.model.startswith("gemini/"):
             if USE_VERTEX_AUTH:
                 litellm_request["vertex_project"] = VERTEX_PROJECT
@@ -1145,7 +811,7 @@ async def create_message(
             logger.debug(f"Using Anthropic API key for model: {request.model}")
         
         # For OpenAI models - modify request format to work with limitations
-        if "openai" in litellm_request["model"] and "messages" in litellm_request:
+        if litellm_request["model"].startswith(("openai/", "openrouter/")) and "messages" in litellm_request:
             logger.debug(f"Processing OpenAI model request: {litellm_request['model']}")
             
             # For OpenAI models, we need to convert content blocks to simple strings
@@ -1289,18 +955,21 @@ async def create_message(
         if request.stream:
             # Use LiteLLM for streaming
             num_tools = len(request.tools) if request.tools else 0
-            
+            start_time = time.time()
+            # Ensure we use the async version for streaming
+            response_generator = await litellm.acompletion(**litellm_request)
+            setup_time_ms = (time.time() - start_time) * 1000.0
+
             log_request_beautifully(
-                "POST", 
-                raw_request.url.path, 
-                display_model, 
+                "POST",
+                raw_request.url.path,
+                display_model,
                 litellm_request.get('model'),
                 len(litellm_request['messages']),
                 num_tools,
-                200  # Assuming success at this point
+                200,
+                setup_time_ms,
             )
-            # Ensure we use the async version for streaming
-            response_generator = await litellm.acompletion(**litellm_request)
             
             return StreamingResponse(
                 handle_streaming(response_generator, request),
@@ -1309,19 +978,21 @@ async def create_message(
         else:
             # Use LiteLLM for regular completion
             num_tools = len(request.tools) if request.tools else 0
-            
+
+            start_time = time.time()
+            litellm_response = litellm.completion(**litellm_request)
+            response_time_ms = (time.time() - start_time) * 1000.0
+
             log_request_beautifully(
-                "POST", 
-                raw_request.url.path, 
-                display_model, 
+                "POST",
+                raw_request.url.path,
+                display_model,
                 litellm_request.get('model'),
                 len(litellm_request['messages']),
                 num_tools,
-                200  # Assuming success at this point
+                200,
+                response_time_ms,
             )
-            start_time = time.time()
-            litellm_response = litellm.completion(**litellm_request)
-            logger.debug(f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
             
             # Convert LiteLLM response to Anthropic format
             anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
@@ -1381,6 +1052,16 @@ async def create_message(
         
         # Return detailed error
         status_code = error_details.get('status_code', 500)
+        log_request_beautifully(
+            "POST",
+            raw_request.url.path,
+            request.model if hasattr(request, "model") else "unknown",
+            request.model if hasattr(request, "model") else "unknown",
+            len(getattr(request, "messages", []) or []),
+            len(getattr(request, "tools", []) or []),
+            status_code,
+            0.0,
+        )
         raise HTTPException(status_code=status_code, detail=error_message)
 
 @app.post("/v1/messages/count_tokens")
@@ -1396,13 +1077,6 @@ async def count_tokens(
         display_model = original_model
         if "/" in display_model:
             display_model = display_model.split("/")[-1]
-        
-        # Clean model name for capability check
-        clean_model = request.model
-        if clean_model.startswith("anthropic/"):
-            clean_model = clean_model[len("anthropic/"):]
-        elif clean_model.startswith("openai/"):
-            clean_model = clean_model[len("openai/"):]
         
         # Convert the messages to a format LiteLLM can understand
         converted_request = convert_anthropic_to_litellm(
@@ -1421,19 +1095,8 @@ async def count_tokens(
         try:
             # Import token_counter function
             from litellm import token_counter
-            
-            # Log the request beautifully
             num_tools = len(request.tools) if request.tools else 0
-            
-            log_request_beautifully(
-                "POST",
-                raw_request.url.path,
-                display_model,
-                converted_request.get('model'),
-                len(converted_request['messages']),
-                num_tools,
-                200  # Assuming success at this point
-            )
+            start_time = time.time()
             
             # Prepare token counter arguments
             token_counter_args = {
@@ -1444,9 +1107,23 @@ async def count_tokens(
             # Add custom base URL for OpenAI models if configured
             if request.model.startswith("openai/") and OPENAI_BASE_URL:
                 token_counter_args["api_base"] = OPENAI_BASE_URL
+            elif request.model.startswith("openrouter/") and OPENROUTER_BASE_URL:
+                token_counter_args["api_base"] = OPENROUTER_BASE_URL
             
             # Count tokens
             token_count = token_counter(**token_counter_args)
+
+            response_time_ms = (time.time() - start_time) * 1000.0
+            log_request_beautifully(
+                "POST",
+                raw_request.url.path,
+                display_model,
+                converted_request.get('model'),
+                len(converted_request['messages']),
+                num_tools,
+                200,
+                response_time_ms,
+            )
             
             # Return Anthropic-style response
             return TokenCountResponse(input_tokens=token_count)
@@ -1466,53 +1143,7 @@ async def count_tokens(
 async def root():
     return {"message": "Anthropic Proxy for LiteLLM"}
 
-# Define ANSI color codes for terminal output
-class Colors:
-    CYAN = "\033[96m"
-    BLUE = "\033[94m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    MAGENTA = "\033[95m"
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    UNDERLINE = "\033[4m"
-    DIM = "\033[2m"
-def log_request_beautifully(method, path, claude_model, openai_model, num_messages, num_tools, status_code):
-    """Log requests in a beautiful, twitter-friendly format showing Claude to OpenAI mapping."""
-    # Format the Claude model name nicely
-    claude_display = f"{Colors.CYAN}{claude_model}{Colors.RESET}"
-    
-    # Extract endpoint name
-    endpoint = path
-    if "?" in endpoint:
-        endpoint = endpoint.split("?")[0]
-    
-    # Extract just the OpenAI model name without provider prefix
-    openai_display = openai_model
-    if "/" in openai_display:
-        openai_display = openai_display.split("/")[-1]
-    openai_display = f"{Colors.GREEN}{openai_display}{Colors.RESET}"
-    
-    # Format tools and messages
-    tools_str = f"{Colors.MAGENTA}{num_tools} tools{Colors.RESET}"
-    messages_str = f"{Colors.BLUE}{num_messages} messages{Colors.RESET}"
-    
-    # Format status code
-    status_str = f"{Colors.GREEN}✓ {status_code} OK{Colors.RESET}" if status_code == 200 else f"{Colors.RED}✗ {status_code}{Colors.RESET}"
-    
-
-    # Put it all together in a clear, beautiful format
-    log_line = f"{Colors.BOLD}{method} {endpoint}{Colors.RESET} {status_str}"
-    model_line = f"{claude_display} → {openai_display} {tools_str} {messages_str}"
-    
-    # Print to console
-    print(log_line)
-    print(model_line)
-    sys.stdout.flush()
-
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--help":
         print("Run with: uvicorn server:app --reload --host 0.0.0.0 --port 8082")
         sys.exit(0)
