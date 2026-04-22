@@ -103,6 +103,12 @@ services:
       - 8082:8082
 ```
 
+Or rebuild and restart the service with:
+
+```bash
+docker compose up -d --force-recreate
+```
+
 Or with a command:
 
 ```bash

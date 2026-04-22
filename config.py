@@ -19,6 +19,8 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 # Vertex AI configuration
 VERTEX_PROJECT = os.environ.get("VERTEX_PROJECT", "unset")
@@ -57,7 +59,23 @@ GEMINI_MODELS = [
     "gemini-3-flash-preview"
 ]
 
-PROVIDER_PREFIXES = ("openai/", "gemini/", "anthropic/", "openrouter/")
+DEEPSEEK_MODELS = [
+    "deepseek-chat",
+    "deepseek-reasoner",
+]
+
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-8b-8192",
+    "llama3-70b-8192",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+    "qwen-qwq-32b",
+    "deepseek-r1-distill-llama-70b",
+]
+
+PROVIDER_PREFIXES = ("openai/", "gemini/", "anthropic/", "openrouter/", "deepseek/", "groq/")
 
 
 def strip_provider_prefix(model_name: str) -> str:
@@ -97,6 +115,18 @@ def resolve_model_name(original_model: str) -> Tuple[str, bool]:
 
     if clean_model in OPENAI_MODELS and not original_model.startswith("openai/"):
         return f"openai/{clean_model}", True
+
+    if clean_model in DEEPSEEK_MODELS and not original_model.startswith("deepseek/"):
+        return f"deepseek/{clean_model}", True
+
+    if clean_model in GROQ_MODELS and not original_model.startswith("groq/"):
+        return f"groq/{clean_model}", True
+
+    if PREFERRED_PROVIDER == "deepseek" and not has_provider_prefix(original_model):
+        return f"deepseek/{clean_model}", True
+
+    if PREFERRED_PROVIDER == "groq" and not has_provider_prefix(original_model):
+        return f"groq/{clean_model}", True
 
     if PREFERRED_PROVIDER == "openrouter" and not has_provider_prefix(original_model):
         return f"openrouter/{clean_model}", True

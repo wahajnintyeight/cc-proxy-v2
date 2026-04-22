@@ -4,13 +4,17 @@ import json
 from typing import Any, Dict, Union
 from fastapi.responses import StreamingResponse
 import litellm
+from groq import Groq
+from openai import OpenAI
 import uuid
 import time
 import sys
 
 from config import (
     ANTHROPIC_API_KEY,
+    DEEPSEEK_API_KEY,
     GEMINI_API_KEY,
+    GROQ_API_KEY,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     OPENROUTER_API_KEY,
@@ -37,6 +41,99 @@ logger = configure_logging(__name__)
 litellm.drop_params = True
 
 app = FastAPI()
+
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+deepseek_client = OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com/v1",
+) if DEEPSEEK_API_KEY else None
+
+
+def _is_groq_model(model_name: str) -> bool:
+    return model_name.startswith("groq/")
+
+
+def _is_deepseek_model(model_name: str) -> bool:
+    return model_name.startswith("deepseek/")
+
+
+def _build_openai_messages(request: MessagesRequest) -> list[Dict[str, Any]]:
+    converted_request = convert_anthropic_to_litellm(request)
+    return converted_request["messages"]
+
+
+def _to_async_iterator(sync_iterator):
+    async def iterator():
+        for item in sync_iterator:
+            yield item
+
+    return iterator()
+
+
+def _build_sdk_kwargs(request: MessagesRequest) -> Dict[str, Any]:
+    messages = _build_openai_messages(request)
+    kwargs: Dict[str, Any] = {
+        "model": strip_provider_prefix(request.model),
+        "messages": messages,
+        "temperature": request.temperature,
+        "stream": request.stream,
+    }
+
+    if request.stop_sequences:
+        kwargs["stop"] = request.stop_sequences
+
+    if request.top_p:
+        kwargs["top_p"] = request.top_p
+
+    if request.top_k:
+        kwargs["top_k"] = request.top_k
+
+    if request.tools:
+        kwargs["tools"] = litellm_request_tools = convert_anthropic_to_litellm(request).get("tools")
+        if not litellm_request_tools:
+            kwargs.pop("tools", None)
+
+    if request.tool_choice:
+        converted = convert_anthropic_to_litellm(request).get("tool_choice")
+        if converted:
+            kwargs["tool_choice"] = converted
+
+    if request.model.startswith("groq/"):
+        kwargs["max_completion_tokens"] = request.max_tokens
+    else:
+        kwargs["max_tokens"] = request.max_tokens
+
+    return kwargs
+
+
+async def _handle_sdk_provider_request(request: MessagesRequest):
+    kwargs = _build_sdk_kwargs(request)
+    if _is_groq_model(request.model):
+        if groq_client is None:
+            raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured")
+        client = groq_client
+    elif _is_deepseek_model(request.model):
+        if deepseek_client is None:
+            raise HTTPException(status_code=500, detail="DEEPSEEK_API_KEY is not configured")
+        client = deepseek_client
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported SDK provider model")
+
+    if request.stream:
+        response_stream = client.chat.completions.create(**kwargs)
+        return StreamingResponse(
+            handle_streaming(_to_async_iterator(response_stream), request),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    response = client.chat.completions.create(**{k: v for k, v in kwargs.items() if k != "stream"})
+    anthropic_response = convert_litellm_to_anthropic(response, request)
+    return anthropic_response
 
 # Helper function to clean schema for Gemini
 def clean_gemini_schema(schema: Any) -> Any:
@@ -209,9 +306,9 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     
     # Cap max_tokens for OpenAI models to their limit of 16384
     max_tokens = anthropic_request.max_tokens
-    if anthropic_request.model.startswith(("openai/", "gemini/", "openrouter/")):
+    if anthropic_request.model.startswith(("openai/", "gemini/", "openrouter/", "deepseek/", "groq/")):
         max_tokens = min(max_tokens, 16384)
-        logger.debug(f"Capping max_tokens to 16384 for OpenAI/Gemini/OpenRouter model (original value: {anthropic_request.max_tokens})")
+        logger.debug(f"Capping max_tokens to 16384 for OpenAI/Gemini/OpenRouter/DeepSeek/Groq model (original value: {anthropic_request.max_tokens})")
     
     # Create LiteLLM request dict
     litellm_request = {
@@ -773,6 +870,9 @@ async def create_message(
         clean_model = strip_provider_prefix(clean_model)
         
         logger.debug(f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}")
+
+        if request.model.startswith(("groq/", "deepseek/")):
+            return await _handle_sdk_provider_request(request)
         
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
@@ -809,12 +909,18 @@ async def create_message(
             else:
                 litellm_request["api_key"] = GEMINI_API_KEY
                 logger.debug(f"Using Gemini API key for model: {request.model}")
+        elif request.model.startswith("deepseek/"):
+            litellm_request["api_key"] = DEEPSEEK_API_KEY
+            logger.debug(f"Using DeepSeek API key for model: {request.model}")
+        elif request.model.startswith("groq/"):
+            litellm_request["api_key"] = GROQ_API_KEY
+            logger.debug(f"Using Groq API key for model: {request.model}")
         else:
             litellm_request["api_key"] = ANTHROPIC_API_KEY
             logger.debug(f"Using Anthropic API key for model: {request.model}")
         
         # For OpenAI models - modify request format to work with limitations
-        if litellm_request["model"].startswith(("openai/", "openrouter/")) and "messages" in litellm_request:
+        if litellm_request["model"].startswith(("openai/", "openrouter/", "deepseek/", "groq/")) and "messages" in litellm_request:
             logger.debug(f"Processing OpenAI model request: {litellm_request['model']}")
             
             # For OpenAI models, we need to convert content blocks to simple strings
