@@ -1,0 +1,9 @@
+services:
+  proxy:
+    image: claude-code-proxy:local
+    container_name: cc-proxy
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8082:8082"

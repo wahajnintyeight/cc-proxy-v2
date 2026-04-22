@@ -2,15 +2,17 @@ FROM python:3.12-slim
 
 WORKDIR /claude-code-proxy
 
-# Copy package specifications
-COPY pyproject.toml uv.lock ./
+ENV PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONUNBUFFERED=1
 
-# Install uv and project dependencies
-RUN pip install --upgrade uv && uv sync
+# Install dependencies from the pinned requirements file.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --upgrade pip \
+	&& pip install --no-cache-dir -r requirements.txt
 
-# Copy project code to current directory
+# Copy the application code.
 COPY . .
 
-# Start the proxy
+# Start the proxy.
 EXPOSE 8082
-CMD ["uv", "run", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8082", "--log-level", "warning"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8082", "--log-level", "warning"]

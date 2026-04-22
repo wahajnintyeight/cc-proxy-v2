@@ -33,6 +33,9 @@ from schemas import (
 
 logger = configure_logging(__name__)
 
+# Drop unsupported params (e.g. 'usage') for providers like OpenRouter
+litellm.drop_params = True
+
 app = FastAPI()
 
 # Helper function to clean schema for Gemini
